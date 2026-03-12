@@ -1,0 +1,35 @@
+{
+  "project": "LeadQualification",
+  "description": "Classify new sales leads from historical CRM cases using a reproducible workflow.",
+  "train_path": "data/train_sales_cases.csv",
+  "score_path": "data/new_sales_cases.csv",
+  "id_col": "lead_id",
+  "target_col": "qualified",
+  "numeric_features": [
+    "age",
+    "annual_income",
+    "website_visits",
+    "prior_purchases",
+    "support_tickets"
+  ],
+  "categorical_features": [
+    "region",
+    "channel",
+    "loyalty_segment"
+  ],
+  "algorithm": "logistic_regression",
+  "test_size": 0.25,
+  "random_state": 42,
+  "threshold": 0.55,
+  "cv_folds": 5,
+  "metrics": [
+    "accuracy",
+    "precision",
+    "recall",
+    "f1",
+    "roc_auc"
+  ],
+  "model_file": "artifacts/lead_model.joblib",
+  "predictions_file": "outputs/new_case_predictions.csv",
+  "report_file": "outputs/evaluation_report.json"
+}

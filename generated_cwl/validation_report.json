@@ -1,0 +1,10 @@
+{
+  "project": "validation-only",
+  "missing_train_columns": [],
+  "missing_score_columns": [],
+  "duplicate_features": [],
+  "train_rows": 320,
+  "score_rows": 28,
+  "train_ok": true,
+  "score_ok": true
+}

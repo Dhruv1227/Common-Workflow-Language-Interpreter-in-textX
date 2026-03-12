@@ -1,0 +1,6 @@
+train_csv:
+  class: File
+  path: ../data/train_sales_cases.csv
+score_csv:
+  class: File
+  path: ../data/new_sales_cases.csv

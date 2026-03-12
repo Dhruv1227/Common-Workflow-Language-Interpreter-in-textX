@@ -1,0 +1,17 @@
+{
+  "project": "cwl-training",
+  "algorithm": "logistic_regression",
+  "threshold": 0.55,
+  "metrics": {
+    "accuracy": 0.8,
+    "precision": 0.8205128205128205,
+    "recall": 0.9696969696969697,
+    "f1": 0.8888888888888888,
+    "roc_auc": 0.6071428571428572,
+    "cv_f1_mean": 0.8991435695095975,
+    "cv_f1_std": 0.015225745592820526
+  },
+  "feature_count": 8,
+  "train_rows": 320,
+  "test_rows": 80
+}

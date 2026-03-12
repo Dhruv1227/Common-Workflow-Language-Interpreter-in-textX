@@ -1,0 +1,57 @@
+CaseFlow:
+    'project' name=ID
+    'description' description=STRING
+    data=DataSection
+    features=FeatureSection
+    model=ModelSection
+    metrics=MetricSection
+    outputs=OutputSection
+;
+
+DataSection:
+    'data'
+    'train' train=STRING
+    'score' score=STRING
+    'id' id_col=ColumnRef
+    'target' target_col=ColumnRef
+;
+
+FeatureSection:
+    'features'
+    'numeric' numeric+=ColumnRef[',']
+    'categorical' categorical+=ColumnRef[',']
+;
+
+ColumnRef:
+    value=ID | value=STRING
+;
+
+ModelSection:
+    'model'
+    'algorithm' algorithm=Algorithm
+    'test_size' test_size=STRICTFLOAT
+    'random_state' random_state=INT
+    'threshold' threshold=STRICTFLOAT
+    'cv_folds' cv_folds=INT
+;
+
+Algorithm:
+    value=/logistic_regression|random_forest/
+;
+
+MetricSection:
+    'metrics' metrics+=Metric[',']
+;
+
+Metric:
+    value=/accuracy|precision|recall|f1|roc_auc/
+;
+
+OutputSection:
+    'outputs'
+    'model_file' model_file=STRING
+    'predictions_file' predictions_file=STRING
+    'report_file' report_file=STRING
+;
+
+Comment: /#.*$/;

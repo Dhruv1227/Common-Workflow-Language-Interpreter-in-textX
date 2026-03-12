@@ -1,0 +1,27 @@
+project LeadQualificationRF
+
+description "Alternative scenario with random forest for more non-linear lead qualification."
+
+data
+  train "data/train_sales_cases.csv"
+  score "data/new_sales_cases.csv"
+  id lead_id
+  target qualified
+
+features
+  numeric age, annual_income, website_visits, prior_purchases, support_tickets
+  categorical region, channel, loyalty_segment
+
+model
+  algorithm random_forest
+  test_size 0.25
+  random_state 42
+  threshold 0.70
+  cv_folds 5
+
+metrics accuracy, precision, recall, f1, roc_auc
+
+outputs
+  model_file "artifacts/lead_model_rf.joblib"
+  predictions_file "outputs/new_case_predictions_rf.csv"
+  report_file "outputs/evaluation_report_rf.json"
