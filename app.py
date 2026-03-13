@@ -5,6 +5,7 @@ import sys
 import tempfile
 import zipfile
 import csv
+import subprocess
 import io
 from pathlib import Path
 
@@ -112,6 +113,7 @@ def _plot_prediction_distribution(predictions_df: pd.DataFrame):
     plt.close(fig)
 
 
+
 def _make_zip(folder: Path) -> bytes:
     temp_zip = folder / "session_bundle.zip"
     with zipfile.ZipFile(temp_zip, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -121,6 +123,45 @@ def _make_zip(folder: Path) -> bytes:
     data = temp_zip.read_bytes()
     temp_zip.unlink(missing_ok=True)
     return data
+
+
+def _write_cwl_inputs(outdir: Path, cfg):
+    inputs = {
+        "train_csv": {"class": "File", "path": str((outdir.parent / cfg.train_path).resolve())},
+        "score_csv": {"class": "File", "path": str((outdir.parent / cfg.score_path).resolve())},
+    }
+    import yaml
+    with open(outdir / "inputs.yml", "w", encoding="utf-8") as f:
+        yaml.safe_dump(inputs, f, sort_keys=False)
+    return outdir / "inputs.yml"
+
+
+def _run_cwl_workflow(workdir: Path, workflow_path: Path, inputs_path: Path):
+    try:
+        result = subprocess.run(
+            ["cwltool", str(workflow_path.resolve()), str(inputs_path.resolve())],
+            cwd=str(workdir),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return {
+            "ok": True,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+        }
+    except FileNotFoundError:
+        return {
+            "ok": False,
+            "stdout": "",
+            "stderr": "cwltool is not installed or not available on PATH. Install it with: pip install cwltool",
+        }
+    except subprocess.CalledProcessError as e:
+        return {
+            "ok": False,
+            "stdout": e.stdout,
+            "stderr": e.stderr,
+        }
 
 
 def _dsl_value(value: str) -> str:
@@ -195,15 +236,61 @@ def _detect_target_column(df: pd.DataFrame, id_col: str) -> str:
 
 
 def _infer_feature_groups(df: pd.DataFrame, id_col: str, target_col: str):
-    features = [c for c in df.columns if c not in {id_col, target_col}]
-    numeric, categorical = [], []
-    for col in features:
-        if pd.api.types.is_numeric_dtype(df[col]):
+    excluded = {id_col, target_col}
+
+    numeric = []
+    categorical = []
+
+    for col in df.columns:
+        if col in excluded:
+            continue
+
+        series = df[col]
+
+        if series.dropna().empty:
+            continue
+
+        # Try numeric detection
+        coerced = pd.to_numeric(series, errors="coerce")
+        numeric_ratio = coerced.notna().mean()
+
+        if pd.api.types.is_numeric_dtype(series) or numeric_ratio >= 0.85:
             numeric.append(col)
         else:
             categorical.append(col)
+
+    # Final safety (VERY IMPORTANT)
+    numeric = [c for c in numeric if c not in excluded]
+    categorical = [c for c in categorical if c not in excluded and c not in numeric]
+
     return numeric, categorical
 
+def _prepare_schema_from_user_choice(train_df: pd.DataFrame, target_col: str, id_col_choice: str):
+    df = train_df.copy()
+
+    if id_col_choice == "<auto-generate record_id>":
+        id_col = "record_id"
+        if id_col in df.columns:
+            base = id_col
+            i = 1
+            while id_col in df.columns:
+                id_col = f"{base}_{i}"
+                i += 1
+        df.insert(0, id_col, range(1, len(df) + 1))
+    else:
+        id_col = id_col_choice
+
+    numeric, categorical = _infer_feature_groups(df, id_col, target_col)
+
+    numeric = [c for c in numeric if c not in {id_col, target_col}]
+    categorical = [c for c in categorical if c not in {id_col, target_col}]
+
+    if target_col in numeric or target_col in categorical:
+        raise ValueError(
+            f"Target column '{target_col}' was incorrectly included in features."
+        )
+
+    return df, id_col, numeric, categorical
 
 def _auto_generate_dsl_from_dataset(train_df: pd.DataFrame, train_path: str = "data/train.csv", score_path: str = "data/score.csv") -> tuple[str, dict]:
     id_col = _detect_id_column(train_df)
@@ -276,32 +363,110 @@ if "dsl_text" not in st.session_state:
 if uploaded_dsl is not None:
     st.session_state.dsl_text = uploaded_dsl.getvalue().decode("utf-8")
 
+selected_target = None
+selected_id = None
+preview_df = None
+
+if mode == "Use bundled example":
+    preview_df = _read_csv_auto(DEFAULT_TRAIN)
+elif uploaded_train is not None:
+    preview_df = _read_csv_auto(uploaded_train)
+
+if preview_df is not None:
+    st.subheader("Dataset preview")
+    st.dataframe(preview_df.head(), use_container_width=True)
+
+    target_options = list(preview_df.columns)
+    default_target_index = target_options.index("y") if "y" in target_options else 0
+
+    selected_target = st.selectbox(
+        "Select target column",
+        target_options,
+        index=default_target_index,
+    )
+
+    id_options = ["<auto-generate record_id>"] + list(preview_df.columns)
+    default_id_index = 0
+    for preferred_id in ["record_id", "id", "customer_id", "lead_id", "case_id", "PassengerId"]:
+        if preferred_id in preview_df.columns:
+            default_id_index = id_options.index(preferred_id)
+            break
+
+    selected_id = st.selectbox(
+        "Select ID column (optional)",
+        id_options,
+        index=default_id_index,
+    )
+
 if auto_generate:
     try:
+        if preview_df is None:
+            st.error("Upload or load a training CSV first.")
+            st.stop()
+
+        if selected_target is None or selected_id is None:
+            st.error("Please select a target column and ID option first.")
+            st.stop()
+
+        prepared_df, id_col, numeric, categorical = _prepare_schema_from_user_choice(
+            preview_df,
+            selected_target,
+            selected_id,
+        )
+
         if mode == "Use bundled example":
-            preview_df = _read_csv_auto(DEFAULT_TRAIN)
-            generated_dsl, schema_info = _auto_generate_dsl_from_dataset(
-                preview_df,
-                train_path=f"data/{DEFAULT_TRAIN.name}",
-                score_path=f"data/{DEFAULT_SCORE.name}",
-            )
+            train_path = f"data/{DEFAULT_TRAIN.name}"
+            score_path = f"data/{DEFAULT_SCORE.name}"
         else:
-            if uploaded_train is None:
-                st.error("Upload a training CSV first so the app can infer the DSL specification.")
-                st.stop()
-            preview_df = _read_csv_auto(uploaded_train)
             score_name = uploaded_score.name if uploaded_score is not None else "score.csv"
-            generated_dsl, schema_info = _auto_generate_dsl_from_dataset(
-                preview_df,
-                train_path="data/train.csv",
-                score_path=f"data/{score_name}",
-            )
+            train_path = "data/train.csv"
+            score_path = f"data/{score_name}"
+
+        algorithm = "logistic_regression" if len(numeric) >= len(categorical) else "random_forest"
+        project_name = _clean_project_name(Path(train_path).stem + "_pipeline")
+        description = f"User-guided DSL specification with target '{selected_target}', {len(numeric)} numeric and {len(categorical)} categorical features."
+
+        numeric_line = ", ".join(_dsl_value(col) for col in numeric) if numeric else _dsl_value("__none__")
+        categorical_line = ", ".join(_dsl_value(col) for col in categorical) if categorical else _dsl_value("__none__")
+
+        generated_dsl = f'''project {project_name}
+description {_dsl_value(description)}
+data
+train {_dsl_value(train_path)}
+score {_dsl_value(score_path)}
+id {_dsl_value(id_col)}
+target {_dsl_value(selected_target)}
+features
+numeric {numeric_line}
+categorical {categorical_line}
+model
+algorithm {algorithm}
+test_size 0.20
+random_state 42
+threshold 0.50
+cv_folds 5
+metrics accuracy, precision, recall, f1, roc_auc
+outputs
+model_file "artifacts/{project_name}_model.joblib"
+predictions_file "outputs/{project_name}_predictions.csv"
+report_file "outputs/{project_name}_report.json"
+'''
+
+        schema_info = {
+            "id_column": id_col,
+            "target_column": selected_target,
+            "numeric_features": numeric,
+            "categorical_features": categorical,
+            "recommended_algorithm": algorithm,
+        }
+
         st.session_state.dsl_text = generated_dsl
-        st.success("DSL specification was generated automatically from the dataset schema.")
+        st.success("DSL specification was generated from your selected target and ID settings.")
         st.json(schema_info)
+
     except Exception as exc:
         st.error(f"Automatic DSL generation failed: {exc}")
-
+                
 st.subheader("1) DSL specification")
 dsl_text = st.text_area("Edit the DSL and rerun the workflow", value=st.session_state.dsl_text, height=420)
 st.session_state.dsl_text = dsl_text
@@ -368,12 +533,7 @@ if run_generation or generate_only_cwl:
             with open(outdir / name, "w", encoding="utf-8") as f:
                 yaml.safe_dump(doc, f, sort_keys=False)
 
-        inputs = {
-            "train_csv": {"class": "File", "path": str(workdir / cfg.train_path)},
-            "score_csv": {"class": "File", "path": str(workdir / cfg.score_path)},
-        }
-        with open(outdir / "inputs.yml", "w", encoding="utf-8") as f:
-            yaml.safe_dump(inputs, f, sort_keys=False)
+        inputs_path = _write_cwl_inputs(outdir, cfg)
         (outdir / "dsl_config.json").write_text(json.dumps(cfg.as_dict(), indent=2), encoding="utf-8")
 
         st.subheader("4) Generated CWL assets")
@@ -386,15 +546,30 @@ if run_generation or generate_only_cwl:
         cwl_zip = _make_zip(outdir)
         st.download_button("Download generated CWL bundle", data=cwl_zip, file_name="leadflow_cwl_bundle.zip", mime="application/zip")
 
+        st.subheader("5) CWL execution with cwltool")
+        cwl_result = _run_cwl_workflow(workdir, outdir / "workflow.cwl", inputs_path)
+        if cwl_result["ok"]:
+            st.success("CWL workflow executed successfully with cwltool.")
+            if cwl_result["stdout"]:
+                st.code(cwl_result["stdout"], language="text")
+            if cwl_result["stderr"]:
+                st.code(cwl_result["stderr"], language="text")
+        else:
+            st.warning("CWL workflow execution did not complete successfully.")
+            if cwl_result["stderr"]:
+                st.code(cwl_result["stderr"], language="text")
+            if cwl_result["stdout"]:
+                st.code(cwl_result["stdout"], language="text")
+
         if not generate_only_cwl:
             report = run_training(cfg, workdir)
             predictions = run_scoring(cfg, workdir)
 
-            st.subheader("5) Training summary")
+            st.subheader("6) Training summary")
             _render_metric_cards(report)
             st.json(report)
 
-            st.subheader("6) Scored cases")
+            st.subheader("7) Scored cases")
             st.dataframe(predictions, use_container_width=True)
             _plot_prediction_distribution(predictions)
 
@@ -414,6 +589,7 @@ if run_generation or generate_only_cwl:
 with st.expander("How to run locally"):
     st.code(
         "pip install -r requirements.txt\n"
+        "pip install cwltool\n"
         "streamlit run app.py",
         language="bash",
     )

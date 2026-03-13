@@ -1,33 +1,49 @@
-
 from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-import textwrap
 import yaml
 from leadflow_common import parse_leadflow
+import pandas as pd
+
+
+# Helper functions for CWL compatibility
+
+def _tool_requirements():
+    return {
+        'InlineJavascriptRequirement': {},
+        'EnvVarRequirement': {
+            'envDef': [
+                {'envName': 'PYTHONUNBUFFERED', 'envValue': '1'}
+            ]
+        }
+    }
+
+
+def _as_cli_arguments(items: list[str]):
+    return [{'valueFrom': item} for item in items]
 
 
 def cwl_tool_validate(cfg, src_dir):
     return {
         'cwlVersion': 'v1.2',
         'class': 'CommandLineTool',
-        'baseCommand': ['python3', str(src_dir / 'validate_data.py')],
+        'baseCommand': ['python3', str((src_dir / 'validate_data.py').resolve())],
         'inputs': {
             'train_csv': {'type': 'File', 'inputBinding': {'prefix': '--train', 'position': 1}},
             'score_csv': {'type': 'File', 'inputBinding': {'prefix': '--score', 'position': 2}},
         },
-        'arguments': [
+        'arguments': _as_cli_arguments([
             '--id-col', cfg.id_col,
             '--target-col', cfg.target_col,
             '--numeric', ','.join(cfg.numeric_features),
             '--categorical', ','.join(cfg.categorical_features),
             '--out', 'outputs/validation_report.json',
-        ],
+        ]),
         'outputs': {
             'validation_report': {'type': 'File', 'outputBinding': {'glob': 'outputs/validation_report.json'}}
         },
-        'requirements': {'InlineJavascriptRequirement': {}}
+        'requirements': _tool_requirements(),
     }
 
 
@@ -35,11 +51,11 @@ def cwl_tool_train(cfg, src_dir):
     return {
         'cwlVersion': 'v1.2',
         'class': 'CommandLineTool',
-        'baseCommand': ['python3', str(src_dir / 'train_model.py')],
+        'baseCommand': ['python3', str((src_dir / 'train_model.py').resolve())],
         'inputs': {
             'train_csv': {'type': 'File', 'inputBinding': {'prefix': '--train', 'position': 1}},
         },
-        'arguments': [
+        'arguments': _as_cli_arguments([
             '--id-col', cfg.id_col,
             '--target-col', cfg.target_col,
             '--numeric', ','.join(cfg.numeric_features),
@@ -51,12 +67,12 @@ def cwl_tool_train(cfg, src_dir):
             '--cv-folds', str(cfg.cv_folds),
             '--model-out', cfg.model_file,
             '--report-out', cfg.report_file,
-        ],
+        ]),
         'outputs': {
             'model_file': {'type': 'File', 'outputBinding': {'glob': cfg.model_file}},
             'report_file': {'type': 'File', 'outputBinding': {'glob': cfg.report_file}},
         },
-        'requirements': {'InlineJavascriptRequirement': {}}
+        'requirements': _tool_requirements(),
     }
 
 
@@ -64,22 +80,22 @@ def cwl_tool_score(cfg, src_dir):
     return {
         'cwlVersion': 'v1.2',
         'class': 'CommandLineTool',
-        'baseCommand': ['python3', str(src_dir / 'score_cases.py')],
+        'baseCommand': ['python3', str((src_dir / 'score_cases.py').resolve())],
         'inputs': {
             'score_csv': {'type': 'File', 'inputBinding': {'prefix': '--score', 'position': 1}},
             'model_file': {'type': 'File', 'inputBinding': {'prefix': '--model-in', 'position': 2}},
         },
-        'arguments': [
+        'arguments': _as_cli_arguments([
             '--id-col', cfg.id_col,
             '--numeric', ','.join(cfg.numeric_features),
             '--categorical', ','.join(cfg.categorical_features),
             '--threshold', str(cfg.threshold),
             '--predictions-out', cfg.predictions_file,
-        ],
+        ]),
         'outputs': {
             'predictions_file': {'type': 'File', 'outputBinding': {'glob': cfg.predictions_file}}
         },
-        'requirements': {'InlineJavascriptRequirement': {}}
+        'requirements': _tool_requirements(),
     }
 
 
@@ -118,6 +134,55 @@ def cwl_workflow(cfg):
     }
 
 
+def _infer_feature_groups(df: pd.DataFrame, id_col: str, target_col: str):
+    excluded = {id_col, target_col}
+    numeric = []
+    categorical = []
+
+    for col in df.columns:
+        if col in excluded:
+            continue
+
+        series = df[col]
+        if series.dropna().empty:
+            continue
+
+        lowered = str(col).strip().lower()
+        if lowered in {"target", "label", "class", "y", "outcome", "qualified", "survived", "income", "churn", "default"} and col == target_col:
+            continue
+
+        # Try strong numeric detection first
+        coerced = pd.to_numeric(series, errors="coerce")
+        numeric_ratio = coerced.notna().mean()
+
+        if pd.api.types.is_numeric_dtype(series) or numeric_ratio >= 0.85:
+            numeric.append(col)
+        else:
+            categorical.append(col)
+
+    # Final safety: never allow id/target to leak into features
+    numeric = [c for c in dict.fromkeys(numeric) if c not in excluded]
+    categorical = [c for c in dict.fromkeys(categorical) if c not in excluded and c not in numeric]
+    return numeric, categorical
+
+
+def _auto_generate_dsl_from_dataset(train_df: pd.DataFrame, score_df: pd.DataFrame, id_col: str, target_col: str):
+    numeric, categorical = _infer_feature_groups(train_df, id_col, target_col)
+    numeric = [c for c in numeric if c not in {id_col, target_col}]
+    categorical = [c for c in categorical if c not in {id_col, target_col}]
+
+    # ... other code to generate the DSL ...
+
+    if target_col in numeric or target_col in categorical:
+        raise ValueError(
+            f"Target column '{target_col}' was incorrectly included in the feature list. "
+            "Please review the dataset and edit the DSL manually."
+        )
+
+    # Assuming the function returns a tuple like (id_col, target_col, numeric, categorical, ...)
+    return id_col, target_col, numeric, categorical
+
+
 def generate_all(grammar_path: Path, dsl_path: Path, out_dir: Path):
     cfg = parse_leadflow(grammar_path, dsl_path)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -133,8 +198,8 @@ def generate_all(grammar_path: Path, dsl_path: Path, out_dir: Path):
         yaml.safe_dump(cwl_workflow(cfg), f, sort_keys=False)
 
     inputs = {
-        'train_csv': {'class': 'File', 'path': '../' + cfg.train_path},
-        'score_csv': {'class': 'File', 'path': '../' + cfg.score_path},
+        'train_csv': {'class': 'File', 'path': str((out_dir.parent / cfg.train_path).resolve())},
+        'score_csv': {'class': 'File', 'path': str((out_dir.parent / cfg.score_path).resolve())},
     }
     with open(out_dir / 'inputs.yml', 'w', encoding='utf-8') as f:
         yaml.safe_dump(inputs, f, sort_keys=False)
