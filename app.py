@@ -4,6 +4,8 @@ import shutil
 import sys
 import tempfile
 import zipfile
+import csv
+import io
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -31,6 +33,33 @@ def _write_uploaded(uploaded_file, destination: Path):
     destination.write_bytes(uploaded_file.getvalue())
 
 
+def _read_csv_auto(source) -> pd.DataFrame:
+    if hasattr(source, "getvalue"):
+        raw = source.getvalue()
+    else:
+        raw = Path(source).read_bytes()
+
+    text = raw.decode("utf-8", errors="ignore")
+    sample = text[:5000]
+
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=",;|\t")
+        sep = dialect.delimiter
+    except csv.Error:
+        sep = ";" if sample.count(";") > sample.count(",") else ","
+
+    df = pd.read_csv(io.StringIO(text), sep=sep)
+    df.columns = [str(c).strip().strip('"').strip("'") for c in df.columns]
+    df = df.dropna(axis=1, how="all")
+    return df
+
+
+def _write_normalized_csv(uploaded_file, destination: Path):
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    df = _read_csv_auto(uploaded_file)
+    df.to_csv(destination, index=False)
+
+
 def _render_metric_cards(report: dict):
     metrics = report.get("metrics", {})
     cols = st.columns(5)
@@ -42,10 +71,43 @@ def _render_metric_cards(report: dict):
 
 def _plot_prediction_distribution(predictions_df: pd.DataFrame):
     fig, ax = plt.subplots(figsize=(7, 4))
-    predictions_df["qualified_probability"].hist(ax=ax, bins=12)
-    ax.set_title("Prediction Probability Distribution")
-    ax.set_xlabel("Qualified probability")
-    ax.set_ylabel("Count")
+
+    # try to detect a probability column automatically
+    prob_col = None
+    for candidate in [
+        "qualified_probability",
+        "probability",
+        "predicted_probability",
+        "score",
+        "prediction_probability",
+    ]:
+        if candidate in predictions_df.columns:
+            prob_col = candidate
+            break
+
+    if prob_col:
+        predictions_df[prob_col].hist(ax=ax, bins=12)
+        ax.set_title("Prediction Probability Distribution")
+        ax.set_xlabel(prob_col)
+        ax.set_ylabel("Count")
+
+    elif "predicted_class" in predictions_df.columns:
+        predictions_df["predicted_class"].value_counts().sort_index().plot(kind="bar", ax=ax)
+        ax.set_title("Predicted Class Distribution")
+        ax.set_xlabel("Predicted Class")
+        ax.set_ylabel("Count")
+
+    else:
+        ax.text(
+            0.5,
+            0.5,
+            f"No probability column found. Available columns: {list(predictions_df.columns)}",
+            ha="center",
+            va="center",
+            wrap=True,
+        )
+        ax.set_axis_off()
+
     st.pyplot(fig)
     plt.close(fig)
 
@@ -77,29 +139,59 @@ def _clean_project_name(name: str) -> str:
 
 
 def _detect_id_column(df: pd.DataFrame) -> str:
-    candidates = [c for c in df.columns if c.lower() in {"id", "lead_id", "customer_id", "case_id", "record_id"}]
+    candidates = [c for c in df.columns if c.lower() in {"id", "lead_id", "customer_id", "case_id", "record_id", "passengerid"}]
     if candidates:
         return candidates[0]
+
     uniqueness = []
     for col in df.columns:
+        # do not treat obvious target-like names as IDs
+        if str(col).strip().lower() in {"target", "label", "class", "y", "outcome", "qualified", "survived", "income", "churn", "default"}:
+            continue
         ratio = df[col].nunique(dropna=False) / max(len(df), 1)
-        if ratio >= 0.95:
+        if ratio >= 0.98:
             uniqueness.append(col)
-    return uniqueness[0] if uniqueness else df.columns[0]
+
+    return uniqueness[0] if uniqueness else "record_id"
 
 
 def _detect_target_column(df: pd.DataFrame, id_col: str) -> str:
-    priority = [c for c in df.columns if c.lower() in {"label", "target", "class", "qualified", "outcome", "y"}]
-    if priority:
-        return priority[0]
-    binary_like = []
+    preferred_names = {
+        "target", "label", "class", "y", "outcome", "qualified", "survived",
+        "income", "churn", "default", "approved", "converted", "response"
+    }
+
+    # 1. Prefer well-known target names, but only if they are truly binary
+    for col in df.columns:
+        if col == id_col:
+            continue
+        col_norm = str(col).strip().lower()
+        unique_count = df[col].dropna().nunique()
+        if col_norm in preferred_names and unique_count == 2:
+            return col
+
+    # 2. Otherwise collect only binary columns
+    binary_candidates = []
     for col in df.columns:
         if col == id_col:
             continue
         unique_count = df[col].dropna().nunique()
-        if 2 <= unique_count <= 10:
-            binary_like.append(col)
-    return binary_like[-1] if binary_like else df.columns[-1]
+        if unique_count == 2:
+            binary_candidates.append(col)
+
+    # 3. If exactly one binary column exists, use it
+    if len(binary_candidates) == 1:
+        return binary_candidates[0]
+
+    # 4. If several binary columns exist, prefer one closer to the end of the dataset
+    if len(binary_candidates) > 1:
+        return binary_candidates[-1]
+
+    # 5. No safe target found
+    raise ValueError(
+        "Could not infer a binary target column automatically. "
+        "Please review the dataset and edit the DSL manually."
+    )
 
 
 def _infer_feature_groups(df: pd.DataFrame, id_col: str, target_col: str):
@@ -116,6 +208,11 @@ def _infer_feature_groups(df: pd.DataFrame, id_col: str, target_col: str):
 def _auto_generate_dsl_from_dataset(train_df: pd.DataFrame, train_path: str = "data/train.csv", score_path: str = "data/score.csv") -> tuple[str, dict]:
     id_col = _detect_id_column(train_df)
     target_col = _detect_target_column(train_df, id_col)
+    if target_col == id_col:
+        raise ValueError(
+            f"The inferred target column '{target_col}' is the same as the ID column. "
+            "Please review the dataset and edit the DSL manually."
+        )
     numeric, categorical = _infer_feature_groups(train_df, id_col, target_col)
 
     if not numeric and not categorical:
@@ -182,7 +279,7 @@ if uploaded_dsl is not None:
 if auto_generate:
     try:
         if mode == "Use bundled example":
-            preview_df = pd.read_csv(DEFAULT_TRAIN)
+            preview_df = _read_csv_auto(DEFAULT_TRAIN)
             generated_dsl, schema_info = _auto_generate_dsl_from_dataset(
                 preview_df,
                 train_path=f"data/{DEFAULT_TRAIN.name}",
@@ -192,7 +289,7 @@ if auto_generate:
             if uploaded_train is None:
                 st.error("Upload a training CSV first so the app can infer the DSL specification.")
                 st.stop()
-            preview_df = pd.read_csv(uploaded_train)
+            preview_df = _read_csv_auto(uploaded_train)
             score_name = uploaded_score.name if uploaded_score is not None else "score.csv"
             generated_dsl, schema_info = _auto_generate_dsl_from_dataset(
                 preview_df,
@@ -234,8 +331,8 @@ if run_generation or generate_only_cwl:
             if uploaded_train is None or uploaded_score is None:
                 st.error("Please upload both training and scoring CSV files.")
                 st.stop()
-            _write_uploaded(uploaded_train, workdir / "data" / "train.csv")
-            _write_uploaded(uploaded_score, workdir / "data" / uploaded_score.name)
+            _write_normalized_csv(uploaded_train, workdir / "data" / "train.csv")
+            _write_normalized_csv(uploaded_score, workdir / "data" / uploaded_score.name)
 
         try:
             cfg = parse_leadflow(workdir / "dsl" / "leadflow.tx", workdir / "workflows" / "session.leadflow")
@@ -246,8 +343,8 @@ if run_generation or generate_only_cwl:
         st.subheader("2) Parsed configuration")
         st.json(cfg.as_dict())
 
-        train_df = pd.read_csv(workdir / cfg.train_path)
-        score_df = pd.read_csv(workdir / cfg.score_path)
+        train_df = _read_csv_auto(workdir / cfg.train_path)
+        score_df = _read_csv_auto(workdir / cfg.score_path)
         validation = validate_config(cfg, train_df, score_df)
 
         st.subheader("3) Validation report")
