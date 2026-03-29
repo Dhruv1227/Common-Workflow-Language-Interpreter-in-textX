@@ -216,14 +216,6 @@ Design and implement a DSL capable of describing and executing machine learning 
 
 ---
 
-# Author
-
-Dhruv Patel
-
-Programming Languages Project  
-DSL + Machine Learning Workflow Automation
-
-
 # LeadFlowML
 
 ## Dataset‑Driven DSL for Machine Learning Workflows
